@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/spf13/cobra"
+	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/kyleconroy/sqlc/internal/config"
 	"github.com/kyleconroy/sqlc/internal/debug"
@@ -85,12 +87,16 @@ func Vet(ctx context.Context, e Env, dir, filename string, stderr io.Writer) err
 		cel.Types(
 			&plugin.VetConfig{},
 			&plugin.VetQuery{},
+			&plugin.Explain{},
 		),
 		cel.Variable("query",
 			cel.ObjectType("plugin.VetQuery"),
 		),
 		cel.Variable("config",
 			cel.ObjectType("plugin.VetConfig"),
+		),
+		cel.Variable("explain",
+			cel.ObjectType("plugin.Explain"),
 		),
 	)
 	if err != nil {
@@ -182,13 +188,29 @@ type preparer interface {
 	Prepare(context.Context, string, string) error
 }
 
-type pgxPreparer struct {
+type pgxConn struct {
 	c *pgx.Conn
 }
 
-func (p *pgxPreparer) Prepare(ctx context.Context, name, query string) error {
+func (p *pgxConn) Prepare(ctx context.Context, name, query string) error {
 	_, err := p.c.Prepare(ctx, name, query)
 	return err
+}
+
+func (p *pgxConn) Explain(ctx context.Context, query string, args ...*plugin.Parameter) (*plugin.Explain, error) {
+	eArgs := make([]any, len(args))
+	row := p.c.QueryRow(ctx, "EXPLAIN (ANALYZE, VERBOSE, COSTS, BUFFERS, SETTINGS, SUMMARY, FORMAT JSON) "+query, eArgs...)
+	var result []json.RawMessage
+	if err := row.Scan(&result); err != nil {
+		return nil, err
+	}
+	var ret plugin.PostgresExplain
+	pJSON := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
+	if err := pJSON.Unmarshal(result[0], &ret); err != nil {
+		return nil, err
+	}
+	explain := plugin.Explain{Explain: &plugin.Explain_Pe{Pe: &ret}}
+	return &explain, nil
 }
 
 type dbPreparer struct {
@@ -196,8 +218,32 @@ type dbPreparer struct {
 }
 
 func (p *dbPreparer) Prepare(ctx context.Context, name, query string) error {
-	_, err := p.db.PrepareContext(ctx, query)
+	s, err := p.db.PrepareContext(ctx, query)
+	s.Close()
 	return err
+}
+
+type explainer interface {
+	Explain(context.Context, string, ...*plugin.Parameter) (*plugin.Explain, error)
+}
+
+type mysqlExplainer struct {
+	*sql.DB
+}
+
+func (me *mysqlExplainer) Explain(ctx context.Context, query string, args ...*plugin.Parameter) (*plugin.Explain, error) {
+	eArgs := make([]any, len(args))
+	row := me.QueryRowContext(ctx, "EXPLAIN FORMAT=JSON "+query, eArgs...)
+	var result json.RawMessage
+	if err := row.Scan(&result); err != nil {
+		return nil, err
+	}
+	var ret plugin.MySQLExplain
+	pJSON := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
+	if err := pJSON.Unmarshal(result, &ret); err != nil {
+		return nil, err
+	}
+	return &plugin.Explain{Explain: &plugin.Explain_Me{Me: &ret}}, nil
 }
 
 type checker struct {
@@ -249,8 +295,8 @@ func (c *checker) checkSQL(ctx context.Context, s config.SQL) error {
 		return ErrFailedChecks
 	}
 
-	// TODO: Add MySQL support
 	var prep preparer
+	var expl explainer
 	if s.Database != nil {
 		if c.NoDatabase {
 			return fmt.Errorf("database: connections disabled via command line flag")
@@ -269,7 +315,9 @@ func (c *checker) checkSQL(ctx context.Context, s config.SQL) error {
 				return fmt.Errorf("database: connection error: %s", err)
 			}
 			defer conn.Close(ctx)
-			prep = &pgxPreparer{conn}
+			pConn := &pgxConn{conn}
+			prep = pConn
+			expl = pConn
 		case config.EngineMySQL:
 			db, err := sql.Open("mysql", dburl)
 			if err != nil {
@@ -280,6 +328,7 @@ func (c *checker) checkSQL(ctx context.Context, s config.SQL) error {
 			}
 			defer db.Close()
 			prep = &dbPreparer{db}
+			expl = &mysqlExplainer{db}
 		case config.EngineSQLite:
 			db, err := sql.Open("sqlite3", dburl)
 			if err != nil {
@@ -290,6 +339,9 @@ func (c *checker) checkSQL(ctx context.Context, s config.SQL) error {
 			}
 			defer db.Close()
 			prep = &dbPreparer{db}
+			// SQLite really doesn't want us to depend on the output of EXPLAIN
+			// QUERY PLAN: https://www.sqlite.org/eqp.html
+			expl = nil
 		default:
 			return fmt.Errorf("unsupported database uri: %s", s.Engine)
 		}
@@ -300,8 +352,22 @@ func (c *checker) checkSQL(ctx context.Context, s config.SQL) error {
 	cfg := vetConfig(req)
 	for i, query := range req.Queries {
 		q := vetQuery(query)
+		
+		// TODO ofc don't run explain every time, only when a rule requires its output
+		if expl == nil {
+			fmt.Fprintf(c.Stderr, "%s: %s: %s: error explaining query: database connection required\n", query.Filename, q.Name, name)
+			errored = true
+			continue
+		}
+		explain, err := expl.Explain(ctx, query.Text, query.Params...)
+		if err != nil {
+			fmt.Fprintf(c.Stderr, "%s: %s: %s: error explaining query: %s\n", query.Filename, q.Name, name, err)
+			errored = true
+			continue
+		}
+
 		for _, name := range s.Rules {
-			// Built-in rule
+			// Built-in rules
 			if name == RuleDbPrepare {
 				if prep == nil {
 					fmt.Fprintf(c.Stderr, "%s: %s: %s: error preparing query: database connection required\n", query.Filename, q.Name, name)
@@ -326,6 +392,7 @@ func (c *checker) checkSQL(ctx context.Context, s config.SQL) error {
 			out, _, err := prg.Eval(map[string]any{
 				"query":  q,
 				"config": cfg,
+				"explain": explain,
 			})
 			if err != nil {
 				return err
